@@ -3,19 +3,12 @@ const https = require("https");
 function postJSON(hostname, path, headers, body) {
   return new Promise((resolve, reject) => {
     const data = JSON.stringify(body);
-    const options = {
-      hostname,
-      path,
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Content-Length": Buffer.byteLength(data),
-        ...headers,
-      },
-    };
-    const req = https.request(options, (res) => {
+    const req = https.request({
+      hostname, path, method: "POST",
+      headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(data), ...headers },
+    }, (res) => {
       let raw = "";
-      res.on("data", (chunk) => { raw += chunk; });
+      res.on("data", c => raw += c);
       res.on("end", () => {
         try { resolve({ status: res.statusCode, body: JSON.parse(raw) }); }
         catch { resolve({ status: res.statusCode, body: raw }); }
@@ -28,127 +21,109 @@ function postJSON(hostname, path, headers, body) {
 }
 
 exports.handler = async (event) => {
-  const corsHeaders = {
+  const h = {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Headers": "Content-Type",
     "Access-Control-Allow-Methods": "POST, OPTIONS",
     "Content-Type": "application/json",
   };
 
-  if (event.httpMethod === "OPTIONS") {
-    return { statusCode: 200, headers: corsHeaders, body: "" };
-  }
+  if (event.httpMethod === "OPTIONS") return { statusCode: 200, headers: h, body: "" };
+  if (event.httpMethod !== "POST") return { statusCode: 405, headers: h, body: "Method not allowed" };
 
-  if (event.httpMethod !== "POST") {
-    return { statusCode: 405, headers: corsHeaders, body: "Method not allowed" };
-  }
-
-  const RESEND_KEY = "re_jfRWDZ2n_8FT7b9YmbEXwZjwFyi18eovv";
-  const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY || "";
+  const RESEND = "re_jfRWDZ2n_8FT7b9YmbEXwZjwFyi18eovv";
+  const CLAUDE = process.env.ANTHROPIC_API_KEY || "";
 
   try {
     const payload = JSON.parse(event.body);
     const { action } = payload;
+    console.log("Action:", action, "| Anthropic key present:", !!CLAUDE);
 
-    // ── send-email: sends a pre-built HTML email via Resend ──────────────────
+    // ── personalize: generate AI insight paragraph ──────────────────────────
+    if (action === "personalize") {
+      const { name, brand, gapLabel, answerLog } = payload;
+      if (!CLAUDE) return { statusCode: 500, headers: h, body: JSON.stringify({ error: "API key missing" }) };
+
+      const r = await postJSON("api.anthropic.com", "/v1/messages", {
+        "x-api-key": CLAUDE, "anthropic-version": "2023-06-01",
+      }, {
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 400,
+        system: "You are a senior brand strategist at White and Salt. Write with precision, warmth, and authority. Direct tone, short punchy sentences mixed with longer ones. No bullet points. No em dashes. No generic phrases. Sound like a real person.",
+        messages: [{ role: "user", content: `A founder completed the Brand Gap Audit.\nName: ${name}\nBrand: ${brand}\nPrimary gap: ${gapLabel}\nAnswers:\n${answerLog}\n\nWrite 4-5 sentences to ${name} directly. Open with something specific from their answers. Name what this gap is costing them concretely. Close with what changes when the gap closes. No em dashes. No generic phrases. Max 5 sentences.` }],
+      });
+
+      if (r.status !== 200) return { statusCode: 500, headers: h, body: JSON.stringify({ error: "Claude failed" }) };
+      const text = r.body?.content?.find(b => b.type === "text")?.text || "";
+      return { statusCode: 200, headers: h, body: JSON.stringify({ text }) };
+    }
+
+    // ── send-email ────────────────────────────────────────────────────────────
     if (action === "send-email") {
       const { to, subject, html, replyTo } = payload;
-
-      const result = await postJSON("api.resend.com", "/emails", {
-        "Authorization": `Bearer ${RESEND_KEY}`,
-      }, {
+      const r = await postJSON("api.resend.com", "/emails", { "Authorization": `Bearer ${RESEND}` }, {
         from: "White and Salt <hello@whiteandsalt.com>",
         to: Array.isArray(to) ? to : [to],
         reply_to: replyTo || undefined,
-        subject,
-        html,
+        subject, html,
       });
-
-      if (result.status !== 200 && result.status !== 201) {
-        console.error("Resend error:", result.body);
-        return { statusCode: 500, headers: corsHeaders, body: JSON.stringify({ error: result.body }) };
-      }
-
-      return { statusCode: 200, headers: corsHeaders, body: JSON.stringify({ success: true }) };
+      if (r.status !== 200 && r.status !== 201) return { statusCode: 500, headers: h, body: JSON.stringify({ error: r.body }) };
+      return { statusCode: 200, headers: h, body: JSON.stringify({ success: true }) };
     }
 
-    // ── generate-and-send-audit: generates report via Claude then emails it ──
+    // ── generate-and-send-audit ───────────────────────────────────────────────
     if (action === "generate-and-send-audit") {
-      const { form, gap, secondary, answers, siteCtx, aiText, questions } = payload;
+      const { form, gap, secondary, answers, aiText, questions } = payload;
+      if (!CLAUDE) return { statusCode: 500, headers: h, body: JSON.stringify({ error: "API key missing" }) };
 
-      if (!ANTHROPIC_KEY) {
-        console.error("ANTHROPIC_API_KEY not set");
-        return { statusCode: 500, headers: corsHeaders, body: JSON.stringify({ error: "API key not configured" }) };
-      }
-
-      const auditLog = (answers || []).map((a, i) =>
-        `${(questions || [])[i] || "Q" + i}: ${a || "skipped"}`
-      ).join("\n");
-
-      const siteNote = siteCtx
-        ? `Website: ${form.url}. Industry: ${siteCtx.industry}. Type: ${siteCtx.businessType}. Offering: ${siteCtx.keyOffering}.`
-        : "No website provided.";
-
+      const auditLog = (answers || []).map((a, i) => `${(questions || [])[i] || "Q" + i}: ${a}`).join("\n");
       const secList = (secondary || []).map(g => `${g.label}: ${g.tagline}`).join("\n");
 
-      const prompt = `Generate a complete HTML brand audit report email for ${form.name} at ${form.brand || "their brand"}.
-
-Primary gap: ${gap.label}
-Tagline: ${gap.tagline}
+      const prompt = `Write a premium brand audit report as a complete HTML email for ${form.name} at ${form.brand || "their brand"}.
+Primary gap: ${gap.label} — ${gap.tagline}
 What this gap is: ${gap.what}
 Business impact: ${gap.business}
 How it shows up: ${gap.shows_up}
 How WAS solves it: ${gap.solve}
 Secondary gaps: ${secList || "None"}
 Personalized insight: ${aiText}
-${siteNote}
+Quiz answers: ${auditLog}
 
-Quiz answers:
-${auditLog}
-
-Create a premium HTML email with inline styles only. Max width 680px centered. Structure:
-1. Header: "W&S" in large bold Georgia serif (56px, weight 900), "FREE BRAND GAP AUDIT" in small caps below, thin divider
-2. "Hi ${form.name}," greeting, then the personalized insight in italic Georgia text
-3. Dark block (#181818 background, white text): gap label in large Georgia serif (48px weight 300), tagline below in white
-4. Four sections on #F7F7F7 background with generous padding: WHAT THIS GAP IS / WHAT IT'S COSTING YOU / WHERE YOU'RE FEELING IT / HOW WHITE AND SALT CLOSES THIS GAP
+Create a premium HTML email. Inline styles only. Max 680px centered.
+1. Header: large W&S text (Georgia 56px bold), FREE BRAND GAP AUDIT subtitle
+2. Greeting to ${form.name} with their personalized insight in italic Georgia
+3. Dark block (#181818): gap label in Georgia 48px weight 300, tagline in white
+4. Four #F7F7F7 sections: WHAT THIS GAP IS / WHAT IT'S COSTING YOU / WHERE YOU'RE FEELING IT / HOW WHITE AND SALT CLOSES THIS GAP
 5. Secondary gaps if any
-6. Process overview: Catch the Bug, Map the Gap, Design the Movement
-7. Dark CTA block: "Ready to close it?" heading, pill button linking to https://www.whiteandsalt.com/contact
+6. The WAS Process: Catch the Bug, Map the Gap, Design the Movement
+7. Dark CTA block with pill button to https://www.whiteandsalt.com/contact
 8. Footer: White and Salt · whiteandsalt.com · hello@whiteandsalt.com · San Diego CA
+All text on dark backgrounds must be white. Return only complete HTML starting with <!DOCTYPE html>.`;
 
-All text on dark backgrounds must be white or rgba(255,255,255,0.75). Body text #626161. Headings #181818. Return only complete HTML starting with <!DOCTYPE html>.`;
-
-      const claudeResult = await postJSON("api.anthropic.com", "/v1/messages", {
-        "x-api-key": ANTHROPIC_KEY,
-        "anthropic-version": "2023-06-01",
+      const cr = await postJSON("api.anthropic.com", "/v1/messages", {
+        "x-api-key": CLAUDE, "anthropic-version": "2023-06-01",
       }, {
-        model: "claude-sonnet-4-20250514",
-        max_tokens: 4000,
-        system: "You are a senior brand strategist at White and Salt. Write premium brand audit reports in HTML with inline styles only. No external resources. Make it feel like a $50K agency deliverable.",
+        model: "claude-sonnet-4-20250514", max_tokens: 4000,
+        system: "You are a senior brand strategist at White and Salt. Write premium brand audit reports in HTML with inline styles only.",
         messages: [{ role: "user", content: prompt }],
       });
 
-      const htmlReport = claudeResult.body?.content?.find(b => b.type === "text")?.text || "";
+      console.log("Claude status:", cr.status);
+      if (cr.status !== 200) return { statusCode: 500, headers: h, body: JSON.stringify({ error: "Report generation failed", detail: cr.body }) };
 
-      if (!htmlReport) {
-        console.error("Claude returned no content:", claudeResult.body);
-        return { statusCode: 500, headers: corsHeaders, body: JSON.stringify({ error: "Report generation failed" }) };
-      }
+      const htmlReport = cr.body?.content?.find(b => b.type === "text")?.text || "";
+      if (!htmlReport) return { statusCode: 500, headers: h, body: JSON.stringify({ error: "Empty report" }) };
 
-      // Send to client
-      await postJSON("api.resend.com", "/emails", {
-        "Authorization": `Bearer ${RESEND_KEY}`,
-      }, {
+      console.log("Report generated:", htmlReport.length, "chars");
+
+      await postJSON("api.resend.com", "/emails", { "Authorization": `Bearer ${RESEND}` }, {
         from: "White and Salt <hello@whiteandsalt.com>",
         to: [form.email],
         subject: `Your Brand Gap Audit — ${gap.label}${form.brand ? " · " + form.brand : ""}`,
         html: htmlReport,
       });
 
-      // BCC to studio
-      await postJSON("api.resend.com", "/emails", {
-        "Authorization": `Bearer ${RESEND_KEY}`,
-      }, {
+      await postJSON("api.resend.com", "/emails", { "Authorization": `Bearer ${RESEND}` }, {
         from: "White and Salt <hello@whiteandsalt.com>",
         to: ["hello@whiteandsalt.com"],
         reply_to: form.email,
@@ -156,14 +131,14 @@ All text on dark backgrounds must be white or rgba(255,255,255,0.75). Body text 
         html: htmlReport,
       });
 
-      console.log("Audit report sent to", form.email);
-      return { statusCode: 200, headers: corsHeaders, body: JSON.stringify({ success: true }) };
+      console.log("Emails sent");
+      return { statusCode: 200, headers: h, body: JSON.stringify({ success: true }) };
     }
 
-    return { statusCode: 400, headers: corsHeaders, body: JSON.stringify({ error: "Unknown action" }) };
+    return { statusCode: 400, headers: h, body: JSON.stringify({ error: "Unknown action" }) };
 
   } catch (err) {
-    console.error("Function error:", err.message, err.stack);
-    return { statusCode: 500, headers: corsHeaders, body: JSON.stringify({ error: err.message }) };
+    console.error("Error:", err.message);
+    return { statusCode: 500, headers: h, body: JSON.stringify({ error: err.message }) };
   }
 };
