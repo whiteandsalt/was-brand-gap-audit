@@ -61,9 +61,12 @@ async function logToFlodesk(email, firstName) {
   }
 
   const auth = "Basic " + Buffer.from(KEY + ":").toString("base64");
+
+  // Build payload — include segment_ids in the upsert so it works even if subscriber already exists
   const subscriberPayload = {
     email: email.trim(),
     first_name: (firstName || "").trim() || undefined,
+    segment_ids: SEGMENT ? [SEGMENT] : undefined,
   };
 
   console.log("Flodesk upsert payload:", JSON.stringify(subscriberPayload));
@@ -76,22 +79,6 @@ async function logToFlodesk(email, firstName) {
       subscriberPayload
     );
     console.log("Flodesk upsert status:", up.status, "body:", JSON.stringify(up.body));
-
-    if (SEGMENT && (up.status === 200 || up.status === 201)) {
-      const segPath = "/v1/segments/" + SEGMENT + "/subscribers";
-      console.log("Flodesk segment path:", segPath);
-      const seg = await post(
-        "api.flodesk.com",
-        segPath,
-        { Authorization: auth },
-        { emails: [email.trim()] }
-      );
-      console.log("Flodesk segment status:", seg.status, "body:", JSON.stringify(seg.body));
-    } else if (SEGMENT) {
-      console.log("Flodesk segment skipped: upsert status was", up.status);
-    } else {
-      console.log("Flodesk segment skipped: no FLODESK_SEGMENT_ID set");
-    }
   } catch (e) {
     console.error("Flodesk error:", e.message);
   }
